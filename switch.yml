@@ -1,0 +1,219 @@
+# vim: tabstop=2 expandtab shiftwidth=2 softtabstop=2 smartindent nu ft=yaml
+
+---
+# !!! this is just a draft / idea extracted from our real playbook in order to demonstrate
+# the pre- and post- run cfg fetch and git commit
+# ########################################################################################
+#
+# run w/:
+#   ansible-playbook -l ... -D switch.yml
+#   ansible-playbook -e skip_git_tasks=True -l ... -D -C switch.yml
+#   ansible-playbook -e just_fetch=True -l ... -D switch.yml
+#
+#   configure interfaces:
+#   ansible-playbook -l ... -t vars,command,vlan,iface,lag,vlt -D switch.yml
+#
+# debug: https://acozine.github.io/html/network/user_guide/network_debug_troubleshooting.html
+
+- name: run checks ...
+  hosts: switch
+  gather_facts: no
+  strategy: linear
+  vars:
+    ansible_become: no
+    switch_cfg_backup_dir: backup
+    backup_filename: "{{ inventory_hostname }}.cfg"
+    required_ansible_version: 2.9.12
+  handlers:
+    - import_tasks: handlers/main.yml
+  pre_tasks:
+    - name: check ansible version
+      assert:
+        that: "ansible_version.full is version_compare('{{ required_ansible_version }}', '>=')"
+        msg: "please use min. ansible version {{ required_ansible_version }}'"
+      run_once: true
+      tags: always
+    - name: "save config to {{ switch_cfg_backup_dir|default('backup') }}"
+      vars:
+        ansible_become: yes
+      dellos6_config:
+        backup: yes
+        save: no
+        update: check
+        backup_options:
+          dir_path: "{{ switch_cfg_backup_dir }}"
+          filename: "{{ backup_filename }}.orig"
+      when:
+        - ansible_network_os == "dellos6"
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: "save config to {{ switch_cfg_backup_dir }}"
+      dellos10_config:
+        backup: yes
+        save: no
+        update: check
+        backup_options:
+          dir_path: "{{ switch_cfg_backup_dir }}"
+          filename: "{{ backup_filename }}.orig"
+      when:
+        - ansible_network_os == "dellos10"
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: strip line matching Last configuration change at ...
+      delegate_to: localhost
+      lineinfile:
+        path: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}.orig"
+        regexp: '^! Last configuration change at .*'
+        state: absent
+      when:
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: "save cleaned up config to {{ switch_cfg_backup_dir }}"
+      delegate_to: localhost
+      copy:
+        src: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}.orig"
+        dest: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}"
+      notify: local git commit cfg before run
+      when:
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - fail:
+        msg: "stop after save due to just_fetch {{ just_fetch }}"
+      when: just_fetch|default(False)
+      tags: always
+
+- name: switch config ...
+  hosts: switch
+  gather_facts: no
+  strategy: linear
+  roles:
+    - role: switch-facts
+      tags:
+        - switch
+        - facts
+      when: # for now w/ 6.6.0.54 this throws "local variable 'key' referenced before assignment"
+        - ansible_network_os == "dellos10"
+    - role: switch-general-config
+      tags:
+        - switch
+        - config
+    - role: switch-command
+      tags:
+        - switch
+        - config
+        - command
+    - role: Dell-Networking.dellos-system
+      tags:
+        - switch
+        - system
+    - role: Dell-Networking.dellos-logging
+      tags:
+        - switch
+        - logging
+        - log
+    - role: Dell-Networking.dellos-ntp
+      tags:
+        - switch
+        - ntp
+    # FIXME: lldp stuff is not idempotent
+    - role: Dell-Networking.dellos-lldp
+      tags:
+        - switch
+        - lldp
+    - role: Dell-Networking.dellos-snmp
+      tags:
+        - switch
+        - snmp
+    - role: Dell-Networking.dellos-dns
+      tags:
+        - switch
+        - dns
+    - role: dell-networking.dellos-aaa # lowercase modules are from git
+      tags:
+        - switch
+        - aaa
+        - radius
+    - role: Dell-Networking.dellos-interface
+      tags:
+        - switch
+        - interface
+        - iface
+    - role: Dell-Networking.dellos-xstp
+      tags:
+        - switch
+        - xstp
+        - vlt
+    - role: Dell-Networking.dellos-vlan
+      tags:
+        - switch
+        - vlan
+    - role: Dell-Networking.dellos-lag
+      tags:
+        - switch
+        - lag
+        - vlt
+    - role: Dell-Networking.dellos-vlt
+      tags:
+        - switch
+        - vlt
+
+- name: post tasks
+  hosts: switch
+  gather_facts: no
+  strategy: linear
+  vars:
+    ansible_become: no
+  handlers:
+    - import_tasks: handlers/main.yml
+  post_tasks:
+    - name: "save config ..."
+      vars:
+        ansible_become: yes
+      dellos6_config:
+        backup: yes
+        save: yes
+        backup_options:
+          dir_path: "{{ switch_cfg_backup_dir }}"
+          filename: "{{ backup_filename }}.orig"
+      when:
+        - ansible_network_os == "dellos6"
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: "save config ..."
+      dellos10_config:
+        backup: yes
+        save: yes
+        backup_options:
+          dir_path: "{{ switch_cfg_backup_dir }}"
+          filename: "{{ backup_filename }}.orig"
+      when:
+        - ansible_network_os == "dellos10"
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: strip line matching Last configuration change at ...
+      delegate_to: localhost
+      lineinfile:
+        path: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}.orig"
+        regexp: '^! Last configuration change at .*'
+        state: absent
+      when:
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+    - name: "save cleaned up config to {{ switch_cfg_backup_dir }}"
+      delegate_to: localhost
+      copy:
+        src: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}.orig"
+        dest: "{{ switch_cfg_backup_dir }}/{{ backup_filename }}"
+      notify: local git commit cfg after run
+      when:
+        - not ansible_check_mode
+        - not skip_git_tasks|default(False)
+      tags: always
+
